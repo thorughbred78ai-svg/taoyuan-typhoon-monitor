@@ -9,6 +9,39 @@ import redis
 
 
 # ============================================================
+# 桃園颱風警報狀態監控系統
+#
+# GitHub Actions
+#       ↓
+# CWA OpenData API
+#       ↓
+# Normalize
+#       ↓
+# Fingerprint
+#       ↓
+# Upstash Redis
+#       ↓
+# 比較上一個狀態
+#       ↓
+# Telegram
+#       ↓
+# 儲存最新狀態
+#
+# Required Environment Variables:
+#
+# CWA_API_KEY
+# REDIS_URL
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
+#
+# Upstash Redis URL example:
+#
+# rediss://default:xxxxx@xxxxx.upstash.io:6379
+#
+# ============================================================
+
+
+# ============================================================
 # Configuration
 # ============================================================
 
@@ -16,6 +49,8 @@ CWA_API_URL = (
     "https://opendata.cwa.gov.tw/"
     "api/v1/rest/datastore/W-C0034-001"
 )
+
+REDIS_KEY = "weather:typhoon:taoyuan"
 
 TARGET_AREAS = [
     "桃園市",
@@ -30,8 +65,6 @@ TARGET_HEADLINES = [
     "解除颱風警報",
 ]
 
-REDIS_KEY = "weather:typhoon:taoyuan"
-
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
@@ -39,36 +72,49 @@ TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 # Environment Variables
 # ============================================================
 
-CWA_API_KEY = os.environ.get("CWA_API_KEY")
-REDIS_URL = os.environ.get("REDIS_URL")
+CWA_API_KEY = os.getenv(
+    "CWA_API_KEY",
+    "",
+).strip()
 
-TELEGRAM_BOT_TOKEN = os.environ.get(
-    "TELEGRAM_BOT_TOKEN"
-)
+REDIS_URL = os.getenv(
+    "REDIS_URL",
+    "",
+).strip()
 
-TELEGRAM_CHAT_ID = os.environ.get(
-    "TELEGRAM_CHAT_ID"
-)
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    "",
+).strip()
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    "",
+).strip()
 
 
 # ============================================================
 # Utility
 # ============================================================
 
-def value_to_string(value, default=""):
+def value_to_string(
+    value,
+    default="",
+):
     """
-    將 CWA API 回傳的各種資料型別安全轉換成字串。
+    將 CWA API 各種資料型別安全轉換成 string。
 
-    支援：
-    - None
-    - str
-    - int / float / bool
-    - dict
-    - list
+    CWA 某些欄位可能是：
+        string
+        dict
+        list
+        number
+        None
 
-    CWA API 某些欄位可能不是單純 string，
-    例如 web 可能回傳 dict，因此不能直接交給
-    "\\n".join()。
+    避免：
+
+        TypeError:
+        sequence item expected str instance, dict found
     """
 
     if value is None:
@@ -77,51 +123,65 @@ def value_to_string(value, default=""):
     if isinstance(value, str):
         return value
 
-    if isinstance(value, (int, float, bool)):
+    if isinstance(
+        value,
+        (int, float, bool),
+    ):
         return str(value)
 
     if isinstance(value, dict):
-        # 常見結構
+
+        # 常見 CWA 結構
         for key in (
             "value",
             "url",
             "href",
             "text",
+            "name",
         ):
-            if key in value and value[key] is not None:
+            if (
+                key in value
+                and value[key] is not None
+            ):
                 return value_to_string(
                     value[key],
                     default,
                 )
 
-        # 找不到明確欄位時，轉成 JSON
         try:
             return json.dumps(
                 value,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
+
         except Exception:
             return str(value)
 
     if isinstance(value, list):
-        converted = [
-            value_to_string(item)
-            for item in value
-        ]
 
-        converted = [
-            item for item in converted if item
-        ]
+        result = []
 
-        return "、".join(converted)
+        for item in value:
+
+            converted = value_to_string(
+                item,
+                "",
+            )
+
+            if converted:
+                result.append(
+                    converted
+                )
+
+        return "、".join(result)
 
     return str(value)
 
 
 def now_iso():
     """
-    回傳 UTC ISO 8601 時間。
+    UTC ISO 8601。
     """
 
     return datetime.now(
@@ -131,23 +191,29 @@ def now_iso():
 
 def format_time(value):
     """
-    將 CWA 時間轉成 Asia/Taipei。
+    CWA 時間轉換為 Asia/Taipei。
     """
 
     if not value:
         return "未提供"
 
-    # 防止 value 是 dict
-    value = value_to_string(value)
+    value = value_to_string(
+        value,
+        "",
+    )
 
     if not value:
         return "未提供"
 
     try:
-        normalized = value.replace(
-            "Z",
-            "+00:00",
-        )
+
+        normalized = value.strip()
+
+        if normalized.endswith("Z"):
+            normalized = (
+                normalized[:-1]
+                + "+00:00"
+            )
 
         dt = datetime.fromisoformat(
             normalized
@@ -167,6 +233,7 @@ def format_time(value):
         )
 
     except Exception:
+
         return value
 
 
@@ -176,7 +243,7 @@ def format_time(value):
 
 def require_environment():
     """
-    確認 GitHub Secrets 是否完整。
+    檢查 GitHub Actions Secrets。
     """
 
     missing = []
@@ -202,9 +269,34 @@ def require_environment():
         )
 
     if missing:
+
         raise RuntimeError(
             "Missing required environment variables: "
             + ", ".join(missing)
+        )
+
+    # --------------------------------------------------------
+    # Upstash Redis URL validation
+    # --------------------------------------------------------
+
+    if not (
+        REDIS_URL.startswith(
+            "redis://"
+        )
+        or
+        REDIS_URL.startswith(
+            "rediss://"
+        )
+        or
+        REDIS_URL.startswith(
+            "unix://"
+        )
+    ):
+
+        raise ValueError(
+            "Invalid REDIS_URL. "
+            "Upstash Redis should normally use "
+            "rediss://..."
         )
 
 
@@ -214,7 +306,7 @@ def require_environment():
 
 def fetch_cwa_data():
     """
-    從中央氣象署取得颱風警報資料。
+    取得中央氣象署颱風警報資料。
     """
 
     headers = {
@@ -224,15 +316,19 @@ def fetch_cwa_data():
 
     params = {
         "format": "JSON",
+
         "areaDesc": ",".join(
             TARGET_AREAS
         ),
+
         "headline": ",".join(
             TARGET_HEADLINES
         ),
     }
 
-    print("Requesting CWA API...")
+    print(
+        "Requesting CWA API..."
+    )
 
     response = requests.get(
         CWA_API_URL,
@@ -250,80 +346,112 @@ def fetch_cwa_data():
 
     data = response.json()
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict,
+    ):
+
         raise RuntimeError(
-            "CWA API response is not a JSON object"
+            "CWA API response is not "
+            "a JSON object."
         )
 
     return data
 
 
 # ============================================================
-# CWA Area Filtering
+# Area Filtering
 # ============================================================
 
 def is_target_area(info):
     """
-    判斷警報是否包含監控區域。
+    判斷是否為桃園／北部海域相關警報。
     """
 
-    if not isinstance(info, dict):
+    if not isinstance(
+        info,
+        dict,
+    ):
         return False
 
-    areas = info.get("area", [])
+    areas = info.get(
+        "area",
+        [],
+    )
 
-    if not isinstance(areas, list):
+    if not isinstance(
+        areas,
+        list,
+    ):
         return False
 
     for area in areas:
 
-        if not isinstance(area, dict):
+        if not isinstance(
+            area,
+            dict,
+        ):
             continue
 
         area_name = value_to_string(
-            area.get("areaDesc")
+            area.get(
+                "areaDesc"
+            ),
+            "",
         )
 
-        if any(
-            target in area_name
-            for target in TARGET_AREAS
-        ):
-            return True
+        for target in TARGET_AREAS:
+
+            if target in area_name:
+                return True
 
     return False
 
 
 # ============================================================
-# Normalize Single Alert
+# Normalize Alert
 # ============================================================
 
 def normalize_alert(info):
     """
-    將單筆 CWA 警報資料標準化。
+    將單筆 CWA alert 轉成穩定格式。
     """
 
-    if not isinstance(info, dict):
+    if not isinstance(
+        info,
+        dict,
+    ):
+
         raise ValueError(
-            "Invalid CWA alert object"
+            "Invalid CWA alert object."
         )
 
     areas = info.get(
         "area",
-        []
+        [],
     )
 
-    if not isinstance(areas, list):
+    if not isinstance(
+        areas,
+        list,
+    ):
         areas = []
 
     area_names = []
 
     for area in areas:
 
-        if not isinstance(area, dict):
+        if not isinstance(
+            area,
+            dict,
+        ):
             continue
 
         area_name = value_to_string(
-            area.get("areaDesc")
+            area.get(
+                "areaDesc"
+            ),
+            "",
         )
 
         if area_name:
@@ -331,47 +459,70 @@ def normalize_alert(info):
                 area_name
             )
 
+    # 移除重複區域
+    area_names = list(
+        dict.fromkeys(
+            area_names
+        )
+    )
+
     area_desc = "、".join(
         area_names
     )
 
     headline = value_to_string(
-        info.get("headline"),
+        info.get(
+            "headline"
+        ),
         "未提供",
     )
 
     description = value_to_string(
-        info.get("description"),
+        info.get(
+            "description"
+        ),
         "未提供",
     )
 
     event = value_to_string(
-        info.get("event"),
+        info.get(
+            "event"
+        ),
         "颱風",
     )
 
     sender = value_to_string(
-        info.get("senderName"),
+        info.get(
+            "senderName"
+        ),
         "中央氣象署",
     )
 
     web = value_to_string(
-        info.get("web"),
+        info.get(
+            "web"
+        ),
         "",
     )
 
     effective = value_to_string(
-        info.get("effective"),
+        info.get(
+            "effective"
+        ),
         "",
     )
 
     onset = value_to_string(
-        info.get("onset"),
+        info.get(
+            "onset"
+        ),
         "",
     )
 
     expires = value_to_string(
-        info.get("expires"),
+        info.get(
+            "expires"
+        ),
         "",
     )
 
@@ -396,50 +547,70 @@ def normalize_alert(info):
 
 
 # ============================================================
-# Telegram Message
+# Build Telegram Message
 # ============================================================
 
 def build_message(alert):
     """
-    建立 Telegram 通知內容。
+    建立 Telegram 訊息。
 
-    所有欄位再次經過 value_to_string，
-    確保 join() 不會收到 dict / list。
+    所有欄位最後再次轉 string，
+    確保 join() 絕對不會遇到 dict。
     """
 
     headline = value_to_string(
-        alert.get("headline"),
+        alert.get(
+            "headline"
+        ),
         "未提供",
     )
 
     area_desc = value_to_string(
-        alert.get("areaDesc"),
+        alert.get(
+            "areaDesc"
+        ),
         "未提供",
     )
 
     event = value_to_string(
-        alert.get("event"),
+        alert.get(
+            "event"
+        ),
         "颱風",
     )
 
     description = value_to_string(
-        alert.get("description"),
+        alert.get(
+            "description"
+        ),
         "未提供",
     )
 
     sender = value_to_string(
-        alert.get("sender"),
+        alert.get(
+            "sender"
+        ),
         "中央氣象署",
     )
 
     web = value_to_string(
-        alert.get("web"),
+        alert.get(
+            "web"
+        ),
         "無",
     )
 
-    onset = alert.get("onset")
-    effective = alert.get("effective")
-    expires = alert.get("expires")
+    onset = alert.get(
+        "onset"
+    )
+
+    effective = alert.get(
+        "effective"
+    )
+
+    expires = alert.get(
+        "expires"
+    )
 
     lines = [
         "🌀 桃園颱風警報通知",
@@ -452,9 +623,12 @@ def build_message(alert):
         "📝 說明：",
         description,
         "",
-        f"⏰ 開始時間：{format_time(onset)}",
-        f"⏱️ 生效時間：{format_time(effective)}",
-        f"🔚 結束時間：{format_time(expires)}",
+        f"⏰ 開始時間："
+        f"{format_time(onset)}",
+        f"⏱️ 生效時間："
+        f"{format_time(effective)}",
+        f"🔚 結束時間："
+        f"{format_time(expires)}",
         "",
         f"🏢 發布單位：{sender}",
         "",
@@ -462,8 +636,7 @@ def build_message(alert):
         web,
     ]
 
-    # 最後保險：
-    # 確保 lines 裡全部都是 str
+    # 最後安全轉換
     lines = [
         value_to_string(
             line,
@@ -481,13 +654,20 @@ def build_message(alert):
 
 def normalize_cwa_response(data):
     """
-    將 CWA API 完整 response 標準化。
+    CWA response → normalized state。
     """
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict,
+    ):
+
         return {
             "valid": False,
-            "reason": "CWA API response 格式錯誤",
+            "reason": (
+                "CWA API response "
+                "格式錯誤"
+            ),
         }
 
     records = data.get(
@@ -495,10 +675,17 @@ def normalize_cwa_response(data):
         {},
     )
 
-    if not isinstance(records, dict):
+    if not isinstance(
+        records,
+        dict,
+    ):
+
         return {
             "valid": False,
-            "reason": "CWA API records 格式錯誤",
+            "reason": (
+                "CWA API records "
+                "格式錯誤"
+            ),
         }
 
     infos = records.get(
@@ -506,34 +693,46 @@ def normalize_cwa_response(data):
         [],
     )
 
-    if not isinstance(infos, list):
+    if not isinstance(
+        infos,
+        list,
+    ):
+
         return {
             "valid": False,
-            "reason": "CWA API info 格式錯誤",
+            "reason": (
+                "CWA API info "
+                "格式錯誤"
+            ),
         }
 
-    if len(infos) == 0:
+    if not infos:
+
         return {
             "valid": False,
-            "reason": "沒有取得 CWA 颱風警報資料",
+            "reason": (
+                "沒有取得 CWA "
+                "颱風警報資料"
+            ),
         }
 
     target_infos = []
 
     for info in infos:
 
-        if not isinstance(info, dict):
-            continue
-
         if is_target_area(info):
-            target_infos.append(info)
 
-    if len(target_infos) == 0:
+            target_infos.append(
+                info
+            )
+
+    if not target_infos:
+
         return {
             "valid": False,
             "reason": (
-                "目前沒有符合桃園／北部海域"
-                "條件的颱風警報"
+                "目前沒有符合桃園／"
+                "北部海域條件的颱風警報"
             ),
         }
 
@@ -542,19 +741,34 @@ def normalize_cwa_response(data):
     for info in target_infos:
 
         try:
-            alert = normalize_alert(info)
-            alerts.append(alert)
 
-        except Exception as error:
-            print(
-                "WARNING: Failed to normalize alert:",
-                repr(error),
+            alert = normalize_alert(
+                info
             )
 
-    if len(alerts) == 0:
+            alerts.append(
+                alert
+            )
+
+        except Exception as error:
+
+            print(
+                "WARNING: Failed to "
+                "normalize alert:"
+            )
+
+            print(
+                repr(error)
+            )
+
+    if not alerts:
+
         return {
             "valid": False,
-            "reason": "無法解析 CWA 警報資料",
+            "reason": (
+                "無法解析 CWA "
+                "警報資料"
+            ),
         }
 
     # --------------------------------------------------------
@@ -564,16 +778,27 @@ def normalize_cwa_response(data):
     alerts.sort(
         key=lambda alert: (
             value_to_string(
-                alert.get("headline")
+                alert.get(
+                    "headline"
+                )
             ),
+
             value_to_string(
-                alert.get("areaDesc")
+                alert.get(
+                    "areaDesc"
+                )
             ),
+
             value_to_string(
-                alert.get("effective")
+                alert.get(
+                    "effective"
+                )
             ),
+
             value_to_string(
-                alert.get("event")
+                alert.get(
+                    "event"
+                )
             ),
         )
     )
@@ -590,28 +815,44 @@ def normalize_cwa_response(data):
     )
 
     fingerprint = hashlib.sha256(
-        fingerprint_source.encode("utf-8")
+        fingerprint_source.encode(
+            "utf-8"
+        )
     ).hexdigest()
 
     # --------------------------------------------------------
-    # Status
+    # Overall Status
     # --------------------------------------------------------
 
     has_active_alert = any(
-        alert.get("status") == "active"
+        alert.get(
+            "status"
+        ) == "active"
         for alert in alerts
     )
 
     all_resolved = all(
-        alert.get("status") == "resolved"
+        alert.get(
+            "status"
+        ) == "resolved"
         for alert in alerts
     )
 
-    overall_status = (
-        "resolved"
-        if all_resolved
-        else "active"
-    )
+    if all_resolved:
+
+        overall_status = (
+            "resolved"
+        )
+
+    else:
+
+        overall_status = (
+            "active"
+        )
+
+    # --------------------------------------------------------
+    # Primary Alert
+    # --------------------------------------------------------
 
     primary = alerts[0]
 
@@ -621,38 +862,124 @@ def normalize_cwa_response(data):
 
     return {
         "valid": True,
+
         "status": overall_status,
-        "hasActiveAlert": has_active_alert,
-        "allResolved": all_resolved,
-        "alertCount": len(alerts),
+
+        "hasActiveAlert": (
+            has_active_alert
+        ),
+
+        "allResolved": (
+            all_resolved
+        ),
+
+        "alertCount": len(
+            alerts
+        ),
+
         "alerts": alerts,
+
         "fingerprint": fingerprint,
-        "fingerprintSource": fingerprint_source,
+
+        "fingerprintSource": (
+            fingerprint_source
+        ),
+
         "message": message,
+
         "checkedAt": now_iso(),
     }
 
 
 # ============================================================
-# Redis
+# Upstash Redis
 # ============================================================
 
 def get_redis():
     """
-    建立 Redis connection。
+    建立 Redis client。
+
+    Upstash 通常使用：
+
+        rediss://default:PASSWORD@HOST:6379
+
+    redis-py 可以直接使用 from_url()。
     """
 
-    return redis.Redis.from_url(
-        REDIS_URL,
-        decode_responses=True,
-        socket_timeout=10,
-        socket_connect_timeout=10,
-    )
+    if not REDIS_URL:
+
+        raise RuntimeError(
+            "REDIS_URL is not configured."
+        )
+
+    redis_url = REDIS_URL.strip()
+
+    # --------------------------------------------------------
+    # URL Scheme
+    # --------------------------------------------------------
+
+    if redis_url.startswith(
+        "rediss://"
+    ):
+
+        print(
+            "Redis URL scheme: rediss://"
+        )
+
+    elif redis_url.startswith(
+        "redis://"
+    ):
+
+        print(
+            "Redis URL scheme: redis://"
+        )
+
+    elif redis_url.startswith(
+        "unix://"
+    ):
+
+        print(
+            "Redis URL scheme: unix://"
+        )
+
+    else:
+
+        raise ValueError(
+            "Invalid REDIS_URL. "
+            "Expected redis://, "
+            "rediss://, or unix://. "
+            "For Upstash use rediss://..."
+        )
+
+    try:
+
+        client = redis.Redis.from_url(
+            redis_url,
+
+            decode_responses=True,
+
+            socket_timeout=10,
+
+            socket_connect_timeout=10,
+
+            retry_on_timeout=True,
+        )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            "Failed to create Redis client: "
+            f"{error}"
+        ) from error
+
+    return client
 
 
-def get_previous_state(r):
+def get_previous_state(
+    redis_client,
+):
     """
-    從 Redis 取得上一個狀態。
+    取得 Redis 上一次狀態。
     """
 
     print(
@@ -660,11 +987,12 @@ def get_previous_state(r):
         f"{REDIS_KEY}"
     )
 
-    raw = r.get(
+    raw = redis_client.get(
         REDIS_KEY
     )
 
     if not raw:
+
         print(
             "No previous Redis state."
         )
@@ -677,27 +1005,57 @@ def get_previous_state(r):
             raw
         )
 
-        if not isinstance(
-            previous,
-            dict,
-        ):
-            print(
-                "WARNING: Redis state "
-                "is not an object."
-            )
-
-            return None
-
-        return previous
-
     except json.JSONDecodeError as error:
 
         print(
             "WARNING: Redis state "
-            f"is invalid JSON: {error}"
+            "is invalid JSON:"
+        )
+
+        print(
+            repr(error)
         )
 
         return None
+
+    if not isinstance(
+        previous,
+        dict,
+    ):
+
+        print(
+            "WARNING: Redis state "
+            "is not a JSON object."
+        )
+
+        return None
+
+    return previous
+
+
+def save_state(
+    redis_client,
+    state,
+):
+    """
+    儲存最新 Redis state。
+    """
+
+    serialized = json.dumps(
+        state,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    redis_client.set(
+        REDIS_KEY,
+        serialized,
+    )
+
+    print(
+        f"Redis state saved: "
+        f"{REDIS_KEY}"
+    )
 
 
 # ============================================================
@@ -709,29 +1067,40 @@ def compare_state(
     previous,
 ):
     """
-    比較目前警報與 Redis 上一次狀態。
+    比較 CWA 目前狀態與 Redis 舊狀態。
     """
 
     has_previous_state = (
         previous is not None
     )
 
-    if not previous:
+    # --------------------------------------------------------
+    # First Run
+    # --------------------------------------------------------
+
+    if not has_previous_state:
 
         fingerprint_changed = True
+
         status_changed = True
 
         # 第一次執行：
         #
         # active
-        #   -> 發送通知
+        #   → 通知
         #
         # resolved
-        #   -> 不發送解除通知
+        #   → 不通知
+        #
         should_notify = (
-            current["status"]
-            == "active"
+            current.get(
+                "status"
+            ) == "active"
         )
+
+    # --------------------------------------------------------
+    # Existing State
+    # --------------------------------------------------------
 
     else:
 
@@ -778,12 +1147,15 @@ def compare_state(
         "hasPreviousState": (
             has_previous_state
         ),
+
         "fingerprintChanged": (
             fingerprint_changed
         ),
+
         "statusChanged": (
             status_changed
         ),
+
         "shouldNotify": (
             should_notify
         ),
@@ -800,27 +1172,35 @@ def build_state(
     should_notify,
 ):
     """
-    建立要儲存在 Redis 的狀態。
+    建立要寫入 Redis 的 state。
     """
 
     now = now_iso()
 
-    previous_first_seen = None
-    previous_last_notified = None
-
     if previous:
 
-        previous_first_seen = (
+        first_seen_at = (
             previous.get(
                 "firstSeenAt"
             )
+            or now
         )
 
-        previous_last_notified = (
+        last_notified_at = (
             previous.get(
                 "lastNotifiedAt"
             )
         )
+
+    else:
+
+        first_seen_at = now
+
+        last_notified_at = None
+
+    if should_notify:
+
+        last_notified_at = now
 
     state = {
         "version": 1,
@@ -836,80 +1216,69 @@ def build_state(
             TARGET_AREAS
         ),
 
-        "status": current[
+        "status": current.get(
             "status"
-        ],
+        ),
 
-        "hasActiveAlert": current[
+        "hasActiveAlert": current.get(
             "hasActiveAlert"
-        ],
+        ),
 
-        "allResolved": current[
+        "allResolved": current.get(
             "allResolved"
-        ],
+        ),
 
-        "alertCount": current[
+        "alertCount": current.get(
             "alertCount"
-        ],
+        ),
 
-        "fingerprint": current[
+        "fingerprint": current.get(
             "fingerprint"
-        ],
+        ),
 
-        "alerts": current[
-            "alerts"
-        ],
+        "alerts": current.get(
+            "alerts",
+            [],
+        ),
 
         "firstSeenAt": (
-            previous_first_seen
-            or now
+            first_seen_at
         ),
 
         "lastCheckedAt": now,
 
         "lastNotifiedAt": (
-            now
-            if should_notify
-            else previous_last_notified
+            last_notified_at
         ),
     }
 
     return state
 
 
-def save_state(
-    r,
-    state,
-):
-    """
-    將最新狀態寫入 Redis。
-    """
-
-    serialized = json.dumps(
-        state,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-    r.set(
-        REDIS_KEY,
-        serialized,
-    )
-
-    print(
-        f"Redis state saved: "
-        f"{REDIS_KEY}"
-    )
-
-
 # ============================================================
 # Telegram
 # ============================================================
 
-def send_telegram(message):
+def send_telegram(
+    message,
+):
     """
-    發送 Telegram 訊息。
+    Telegram Bot API。
     """
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN "
+            "is not configured."
+        )
+
+    if not TELEGRAM_CHAT_ID:
+
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID "
+            "is not configured."
+        )
 
     url = (
         "https://api.telegram.org/"
@@ -919,7 +1288,12 @@ def send_telegram(message):
 
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
+
+        "text": value_to_string(
+            message,
+            "",
+        ),
+
         "disable_web_page_preview": True,
     }
 
@@ -941,13 +1315,22 @@ def send_telegram(message):
     response.raise_for_status()
 
     try:
+
         result = response.json()
+
     except Exception as error:
+
         raise RuntimeError(
-            "Telegram response is not JSON"
+            "Telegram response "
+            "is not JSON."
         ) from error
 
-    if not result.get("ok"):
+    if not result.get(
+        "ok",
+        False,
+    ):
+
+        # 不輸出 bot token
         raise RuntimeError(
             "Telegram API failed: "
             + json.dumps(
@@ -968,13 +1351,15 @@ def send_telegram(message):
 def main():
 
     print("=" * 60)
+
     print(
         "桃園颱風警報狀態監控系統"
     )
+
     print("=" * 60)
 
     # --------------------------------------------------------
-    # Validate environment
+    # Environment
     # --------------------------------------------------------
 
     require_environment()
@@ -1005,10 +1390,13 @@ def main():
         data
     )
 
-    if not current.get("valid"):
+    if not current.get(
+        "valid",
+        False,
+    ):
 
         print(
-            "No matching typhoon alert:"
+            "No matching typhoon alert."
         )
 
         print(
@@ -1018,8 +1406,8 @@ def main():
             )
         )
 
-        # 沒有符合監控條件的資料，
-        # 不修改 Redis 狀態。
+        # 沒有符合條件的警報時，
+        # 不修改 Redis。
         return
 
     # --------------------------------------------------------
@@ -1037,17 +1425,17 @@ def main():
     )
 
     print(
-        f"Has active alert: "
+        "Has active alert: "
         f"{current['hasActiveAlert']}"
     )
 
     print(
-        f"All resolved: "
+        "All resolved: "
         f"{current['allResolved']}"
     )
 
     print(
-        f"Fingerprint: "
+        "Fingerprint: "
         f"{current['fingerprint']}"
     )
 
@@ -1055,19 +1443,26 @@ def main():
     # Redis
     # --------------------------------------------------------
 
-    r = get_redis()
+    redis_client = get_redis()
 
     try:
 
-        # 測試 Redis 連線
-        r.ping()
+        print(
+            "Testing Redis connection..."
+        )
+
+        redis_client.ping()
 
         print(
             "Redis connection: OK"
         )
 
+        # ----------------------------------------------------
+        # Previous State
+        # ----------------------------------------------------
+
         previous = get_previous_state(
-            r
+            redis_client
         )
 
         # ----------------------------------------------------
@@ -1100,7 +1495,36 @@ def main():
         )
 
         # ----------------------------------------------------
-        # Build state
+        # Telegram
+        #
+        # Telegram 成功之後才寫 Redis。
+        #
+        # 如果 Telegram 發送失敗：
+        #
+        #   GitHub Actions = failed
+        #   Redis = 保留舊狀態
+        #
+        # 下一次執行仍會重新通知。
+        # ----------------------------------------------------
+
+        if comparison[
+            "shouldNotify"
+        ]:
+
+            send_telegram(
+                current[
+                    "message"
+                ]
+            )
+
+        else:
+
+            print(
+                "No notification required."
+            )
+
+        # ----------------------------------------------------
+        # Build + Save State
         # ----------------------------------------------------
 
         state = build_state(
@@ -1111,39 +1535,8 @@ def main():
             ],
         )
 
-        # ----------------------------------------------------
-        # Telegram
-        #
-        # 先通知，再保存 Redis。
-        #
-        # 如果 Telegram 失敗：
-        #   - 程式會 raise exception
-        #   - Redis 不會更新
-        #   - GitHub Actions 會顯示失敗
-        #
-        # 下一次執行仍會重新嘗試通知。
-        # ----------------------------------------------------
-
-        if comparison[
-            "shouldNotify"
-        ]:
-
-            send_telegram(
-                current["message"]
-            )
-
-        else:
-
-            print(
-                "No notification required."
-            )
-
-        # ----------------------------------------------------
-        # Save Redis
-        # ----------------------------------------------------
-
         save_state(
-            r,
+            redis_client,
             state,
         )
 
@@ -1154,9 +1547,11 @@ def main():
     finally:
 
         try:
-            r.close()
+
+            redis_client.close()
 
         except Exception:
+
             pass
 
 
@@ -1165,6 +1560,7 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
 
         main()
